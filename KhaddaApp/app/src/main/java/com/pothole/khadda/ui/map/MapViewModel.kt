@@ -8,4 +8,5 @@ import com.pothole.khadda.KhaddaApplication
 class MapViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = (application as KhaddaApplication).repository
     val allEvents = repository.allEventsFlow.asLiveData()
+    val pendingCandidates = repository.getPendingCandidatesFlow().asLiveData()
 }

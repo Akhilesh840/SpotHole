@@ -21,7 +21,8 @@ data class PotholeEvent(
     val algorithm: String = AlgorithmType.Z_DIFF.displayName,
     var status: RepairStatus = RepairStatus.REPORTED,
     var syncStatus: String = "QUEUED",
-    var address: String = ""
+    var address: String = "",
+    val candidateId: String? = null
 ) {
     companion object {
         /**

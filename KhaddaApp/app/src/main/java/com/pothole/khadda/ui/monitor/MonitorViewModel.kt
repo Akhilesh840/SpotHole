@@ -55,6 +55,51 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _currentSpeedKmh.postValue(speedKmh)
     }
 
+    data class VerificationState(
+        val isVerifying: Boolean = false,
+        val current: Int = 0,
+        val total: Int = 0,
+        val confirmed: Int = 0,
+        val rejected: Int = 0,
+        val isComplete: Boolean = false
+    ) {
+        val percentage: Int
+            get() = if (total > 0) ((current.toFloat() / total) * 100).toInt().coerceIn(0, 100) else 0
+    }
+
+    private val _verificationState = MutableLiveData(VerificationState())
+    val verificationState: LiveData<VerificationState> = _verificationState
+
+    fun updateVerificationProgress(current: Int, total: Int, confirmed: Int) {
+        _verificationState.postValue(
+            VerificationState(
+                isVerifying = true,
+                current = current,
+                total = total,
+                confirmed = confirmed,
+                rejected = (current - confirmed).coerceAtLeast(0),
+                isComplete = false
+            )
+        )
+    }
+
+    fun completeVerification(total: Int, confirmed: Int, rejected: Int) {
+        _verificationState.postValue(
+            VerificationState(
+                isVerifying = false,
+                current = total,
+                total = total,
+                confirmed = confirmed,
+                rejected = rejected,
+                isComplete = true
+            )
+        )
+    }
+
+    fun resetVerification() {
+        _verificationState.value = VerificationState()
+    }
+
     fun resetSessionCounter() {
         _sessionPotholeCount.value = 0
         _lastDetectedPothole.value = null

@@ -8,7 +8,7 @@ import org.osmdroid.config.Configuration
 class KhaddaApplication : Application() {
 
     val database by lazy { AppDatabase.getInstance(this) }
-    val repository by lazy { PotholeRepository(database.potholeDao(), database.sessionDao()) }
+    val repository by lazy { PotholeRepository(database.potholeDao(), database.sessionDao(), database.candidateDao()) }
 
     override fun onCreate() {
         super.onCreate()

@@ -9,102 +9,273 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Hybrid Vision Analyzer for validating physical shock anomalies using Computer Vision.
- * 
- * If a pothole is physically detected (Z-DIFF > 5.0), this class scans the corresponding
- * camera frame to visually confirm the pothole's existence using a raw Interpreter.
+ * Hybrid Vision Analyzer for validating physical shock anomalies using YOLOv8 detection.
+ *
+ * Preprocessing:
+ * - Rotates bitmap by [rotationDegrees] so the road is upright.
+ * - Letterboxes with aspect ratio preservation to 640x640 with gray padding 114.
+ * - Normalizes RGB pixels to [0.0, 1.0].
+ *
+ * Output Parsing:
+ * - Supports detection output shapes [1, 5, 8400] (channels first) and [1, 8400, 5] (channels last).
+ * - Extracts maximum class confidence for the pothole class.
  */
-class PotholeVisionAnalyzer(private val context: Context) {
+class PotholeVisionAnalyzer(
+    private val context: Context,
+    val modelFileName: String = DEFAULT_MODEL_FILE
+) {
+
+    companion object {
+        private const val TAG = "VisionAnalyzer"
+        const val DEFAULT_MODEL_FILE = "pothole_model.tflite"
+        const val INPUT_WIDTH = 640
+        const val INPUT_HEIGHT = 640
+        const val NUM_CHANNELS = 3
+    }
+
+    enum class AnalyzerStatus {
+        READY,
+        FAILED
+    }
+
+    var status: AnalyzerStatus = AnalyzerStatus.FAILED
+        private set
+
+    var loadError: String? = null
+        private set
+
+    var tensorLayout: TensorLayout? = null
+        private set
+
+    var outputShape: IntArray? = null
+        private set
 
     private var interpreter: Interpreter? = null
-    private var isModelLoaded = false
 
     init {
+        loadModel()
+    }
+
+    private fun loadModel() {
         try {
-            // Attempt to load the trained YOLOv8 model from the assets folder.
-            val modelBuffer = FileUtil.loadMappedFile(context, "pothole_model.tflite")
-            val options = Interpreter.Options()
-            options.setNumThreads(4) // Use 4 threads for faster CPU inference
-            interpreter = Interpreter(modelBuffer, options)
-            isModelLoaded = true
-            Log.d("VisionAnalyzer", "Successfully loaded pothole_model.tflite!")
+            Log.d(TAG, "Loading TFLite model: $modelFileName")
+            val modelBuffer = FileUtil.loadMappedFile(context, modelFileName)
+            val options = Interpreter.Options().apply {
+                setNumThreads(4) // 4 threads for mobile CPU inference
+            }
+            val interp = Interpreter(modelBuffer, options)
+
+            // Read output tensor 0 shape at load time
+            val outTensor = interp.getOutputTensor(0)
+            val shape = outTensor.shape()
+            outputShape = shape
+            Log.i(TAG, "Model '$modelFileName' loaded successfully. Output tensor 0 shape: ${shape.contentToString()}")
+
+            val layout = PotholeOutputParser.detectLayout(shape)
+            if (layout == null) {
+                val errorMsg = "Unsupported output tensor shape: ${shape.contentToString()}. Expected [1, 5, 8400] or [1, 8400, 5]."
+                Log.e(TAG, errorMsg)
+                interp.close()
+                status = AnalyzerStatus.FAILED
+                loadError = errorMsg
+                return
+            }
+
+            tensorLayout = layout
+            interpreter = interp
+            status = AnalyzerStatus.READY
+            loadError = null
+            Log.i(TAG, "PotholeVisionAnalyzer is READY with tensor layout: $layout")
         } catch (e: Exception) {
-            Log.w("VisionAnalyzer", "pothole_model.tflite not found or invalid. Running in Mock Mode.")
-            isModelLoaded = false
+            val errorMsg = "Failed to load model '$modelFileName': ${e.message}"
+            Log.e(TAG, errorMsg, e)
+            status = AnalyzerStatus.FAILED
+            loadError = errorMsg
+            interpreter = null
         }
     }
 
     /**
-     * Scans the provided image for potholes by manually parsing the YOLOv8-Seg tensor.
+     * Executes inference on the provided bitmap and returns a structured [VisionResult].
+     *
+     * @param bitmap Raw camera frame bitmap.
+     * @param rotationDegrees Sensor rotation degrees (e.g. from CameraX imageInfo.rotationDegrees).
+     * @return [VisionResult] containing max confidence, error if any, and inference duration.
      */
-    fun validatePothole(bitmap: Bitmap): Boolean {
-        Log.d("VisionAnalyzer", "=== STARTING VISION VALIDATION ===")
-        if (!isModelLoaded || interpreter == null) {
-            Log.w("VisionAnalyzer", "Model is not loaded! Falling back to hardware accelerometer.")
-            // Graceful fallback: If the user hasn't trained and uploaded their TFLite model yet,
-            // we default to trusting the accelerometer data (Legacy mode).
-            return true 
+    fun analyze(bitmap: Bitmap, rotationDegrees: Int = 0): VisionResult {
+        if (status != AnalyzerStatus.READY || interpreter == null || tensorLayout == null) {
+            val errorMsg = loadError ?: "Analyzer is in FAILED state"
+            Log.e(TAG, "Cannot run inference: $errorMsg")
+            return VisionResult.error(errorMsg)
         }
 
+        val startTime = System.currentTimeMillis()
+
+        // 0. Fast Human Face Pre-Check
+        if (detectHumanFace(bitmap)) {
+            Log.i(TAG, "Human face detected in camera frame; rejecting as human subject")
+            return VisionResult(
+                maxConfidence = 0.0f,
+                error = null,
+                inferenceMs = System.currentTimeMillis() - startTime,
+                rejectionReason = "Human face detected in frame"
+            )
+        }
+
+        var letterboxedBitmap: Bitmap? = null
+
         try {
-            // 1. Resize image to match the new HuggingFace YOLOv8 Segmentation expected input (640x640)
-            Log.d("VisionAnalyzer", "Step 1: Resizing bitmap from ${bitmap.width}x${bitmap.height} to 640x640")
-            val resized = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
-            
-            // 2. Convert Bitmap to Float ByteBuffer [1, 640, 640, 3] normalized to 0.0 - 1.0
-            Log.d("VisionAnalyzer", "Step 2: Allocating 640x640 ByteBuffer...")
-            val inputBuffer = ByteBuffer.allocateDirect(1 * 640 * 640 * 3 * 4) // 4 bytes per float
-            inputBuffer.order(ByteOrder.nativeOrder())
-            
-            val intValues = IntArray(640 * 640)
-            resized.getPixels(intValues, 0, 640, 0, 0, 640, 640)
-            
+            // 1. Preprocessing: Rotation + Letterbox (aspect-ratio preserved, gray padding 114)
+            letterboxedBitmap = LetterboxUtil.createLetterboxedBitmap(
+                src = bitmap,
+                rotationDegrees = rotationDegrees,
+                targetSize = INPUT_WIDTH,
+                paddingValue = LetterboxUtil.DEFAULT_PADDING_GRAY
+            )
+
+            // 2. Convert to Float ByteBuffer [1, 640, 640, 3] normalized to [0.0, 1.0]
+            val inputBuffer = ByteBuffer.allocateDirect(1 * INPUT_WIDTH * INPUT_HEIGHT * NUM_CHANNELS * 4).apply {
+                order(ByteOrder.nativeOrder())
+            }
+
+            val intValues = IntArray(INPUT_WIDTH * INPUT_HEIGHT)
+            letterboxedBitmap.getPixels(intValues, 0, INPUT_WIDTH, 0, 0, INPUT_WIDTH, INPUT_HEIGHT)
+
             for (pixel in intValues) {
                 inputBuffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f) // Red
                 inputBuffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)  // Green
                 inputBuffer.putFloat((pixel and 0xFF) / 255.0f)          // Blue
             }
 
-            // 3. Prepare YOLOv8-Seg dual output buffers.
-            Log.d("VisionAnalyzer", "Step 3: Allocating dual-tensor output maps for Segmentation model...")
-            // A 640x640 segmentation image outputs two tensors:
-            // Tensor 0: [1, 37, 8400] (4 bbox + 1 confidence + 32 mask coefficients = 37 rows, 8400 anchors)
-            // Tensor 1: [1, 32, 160, 160] (32 prototype masks at 160x160 resolution)
-            val output0 = Array(1) { Array(37) { FloatArray(8400) } }
-            val output1 = Array(1) { Array(32) { Array(160) { FloatArray(160) } } }
-            
-            val outputs: MutableMap<Int, Any> = HashMap()
-            outputs[0] = output0
-            outputs[1] = output1
-
-            // 4. Run Inference (Multiple Inputs/Outputs)
-            Log.d("VisionAnalyzer", "Step 4: Executing TFLite multiple-tensor Inference...")
-            interpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputs)
-            Log.d("VisionAnalyzer", "Step 4: Inference Completed Successfully!")
-
-            // 5. Check if any detected bounding boxes belong to the 'pothole' class
-            // Raised threshold to 25% (0.25f) to prevent noise/blur from triggering false positives!
-            Log.d("VisionAnalyzer", "Step 5: Scanning 8400 anchors for pothole confidences > 0.25...")
-            var maxConfidence = 0.0f
-            for (i in 0 until 8400) {
-                val confidence = output0[0][4][i] // Index 4 is the class confidence score
-                if (confidence > maxConfidence) {
-                    maxConfidence = confidence
+            // 3. Prepare output buffer and run inference
+            val interp = interpreter!!
+            val (rawMaxConfidence, bestDetection) = when (tensorLayout!!) {
+                TensorLayout.CHANNELS_FIRST -> {
+                    val anchors = outputShape?.getOrNull(2) ?: PotholeOutputParser.DEFAULT_ANCHORS
+                    val output = Array(1) { Array(PotholeOutputParser.EXPECTED_CHANNELS) { FloatArray(anchors) } }
+                    interp.run(inputBuffer, output)
+                    PotholeOutputParser.parseChannelsFirstWithFiltering(output, filterGeometry = true)
                 }
-                if (confidence > 0.25f) {
-                    Log.d("VisionAnalyzer", "✅ Pothole Visually Confirmed! Max Confidence found: $confidence")
-                    return true
+                TensorLayout.CHANNELS_LAST -> {
+                    val anchors = outputShape?.getOrNull(1) ?: PotholeOutputParser.DEFAULT_ANCHORS
+                    val output = Array(1) { Array(anchors) { FloatArray(PotholeOutputParser.EXPECTED_CHANNELS) } }
+                    interp.run(inputBuffer, output)
+                    PotholeOutputParser.parseChannelsLastWithFiltering(output, filterGeometry = true)
                 }
             }
-            
-            // If the model ran but found no potholes > 25%, we reject the false positive!
-            Log.d("VisionAnalyzer", "❌ False Positive Rejected: No pothole found in the image. Max confidence was only: $maxConfidence")
-            return false
 
+            var finalConfidence = rawMaxConfidence
+            var rejectionReason: String? = null
+
+            if (bestDetection != null && rawMaxConfidence >= VisionResult.CONFIDENCE_THRESHOLD) {
+                // Check skin chrominance on the candidate box
+                if (hasExcessiveSkin(letterboxedBitmap, bestDetection)) {
+                    Log.i(TAG, "Detection box contains excessive skin chrominance (>25%); rejecting as human")
+                    finalConfidence = 0.0f
+                    rejectionReason = "Skin chrominance detected in detection box"
+                }
+            } else if (rawMaxConfidence < VisionResult.CONFIDENCE_THRESHOLD) {
+                rejectionReason = "Low confidence ($rawMaxConfidence < ${VisionResult.CONFIDENCE_THRESHOLD})"
+            }
+
+            val inferenceMs = System.currentTimeMillis() - startTime
+            val bestBoxArray = bestDetection?.let { floatArrayOf(it.cx, it.cy, it.w, it.h) }
+            Log.d(TAG, "Inference completed in ${inferenceMs}ms: maxConfidence=$finalConfidence, reason=$rejectionReason")
+
+            return VisionResult(
+                maxConfidence = finalConfidence,
+                error = null,
+                inferenceMs = inferenceMs,
+                rejectionReason = rejectionReason,
+                bestBox = bestBoxArray
+            )
         } catch (e: Exception) {
-            Log.e("VisionAnalyzer", "CRASH: Inference failed due to Tensor shape mismatch or Memory limit!", e)
-            e.printStackTrace()
-            return false // Safely reject on crash!
+            val inferenceMs = System.currentTimeMillis() - startTime
+            val errorMsg = "Inference execution failed: ${e.message}"
+            Log.e(TAG, errorMsg, e)
+            return VisionResult.error(errorMsg, inferenceMs)
+        } finally {
+            letterboxedBitmap?.recycle()
         }
+    }
+
+    private fun detectHumanFace(bitmap: Bitmap): Boolean {
+        return try {
+            val width = if (bitmap.width % 2 == 0) bitmap.width else bitmap.width - 1
+            val height = bitmap.height
+            val rgb565 = if (bitmap.config == Bitmap.Config.RGB_565 && bitmap.width == width) {
+                bitmap
+            } else {
+                val b = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+                val canvas = android.graphics.Canvas(b)
+                canvas.drawBitmap(bitmap, 0f, 0f, null)
+                b
+            }
+            val detector = android.media.FaceDetector(width, height, 3)
+            val faces = arrayOfNulls<android.media.FaceDetector.Face>(3)
+            val numFaces = detector.findFaces(rgb565, faces)
+            if (rgb565 !== bitmap) rgb565.recycle()
+            numFaces > 0
+        } catch (t: Throwable) {
+            false
+        }
+    }
+
+    private fun isSkinColor(r: Int, g: Int, b: Int): Boolean {
+        val y = 0.299 * r + 0.587 * g + 0.114 * b
+        val cr = (r - y) * 0.713 + 128
+        val cb = (b - y) * 0.564 + 128
+        return (cr in 133.0..173.0) && (cb in 77.0..127.0) && (r > g) && (r > b)
+    }
+
+    private fun hasExcessiveSkin(bitmap: Bitmap, box: PotholeDetection): Boolean {
+        return try {
+            val x1 = (box.x1).toInt().coerceIn(0, bitmap.width - 1)
+            val y1 = (box.y1).toInt().coerceIn(0, bitmap.height - 1)
+            val x2 = (box.x2).toInt().coerceIn(x1 + 1, bitmap.width)
+            val y2 = (box.y2).toInt().coerceIn(y1 + 1, bitmap.height)
+            val w = x2 - x1
+            val h = y2 - y1
+            if (w < 4 || h < 4) return false
+
+            var skinCount = 0
+            var sampleCount = 0
+            val step = maxOf(1, (w * h) / 400)
+            val pixels = IntArray(w * h)
+            bitmap.getPixels(pixels, 0, w, x1, y1, w, h)
+
+            for (i in pixels.indices step step) {
+                val p = pixels[i]
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                if (isSkinColor(r, g, b)) {
+                    skinCount++
+                }
+                sampleCount++
+            }
+            if (sampleCount == 0) false else (skinCount.toFloat() / sampleCount) > 0.25f
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Backward-compatible convenience method returning a boolean presence flag.
+     * Note: If model failed or was not loaded, returns false and logs error instead of silent mock true.
+     */
+    fun validatePothole(bitmap: Bitmap, rotationDegrees: Int = 0): Boolean {
+        val result = analyze(bitmap, rotationDegrees)
+        return result.isPothole
+    }
+
+    fun close() {
+        try {
+            interpreter?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing interpreter: ${e.message}")
+        }
+        interpreter = null
+        status = AnalyzerStatus.FAILED
     }
 }

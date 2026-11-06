@@ -4,37 +4,47 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.app.Service
-import androidx.lifecycle.LifecycleService
-import androidx.camera.core.*
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.core.content.ContextCompat
-import android.graphics.Bitmap
-import android.util.Size
-import java.util.ArrayDeque
-import kotlin.math.abs
-import java.io.File
-import java.io.FileOutputStream
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
+import android.util.Size
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleService
+import com.pothole.khadda.BuildConfig
 import com.pothole.khadda.KhaddaApplication
 import com.pothole.khadda.detector.*
 import com.pothole.khadda.location.LocationTracker
 import com.pothole.khadda.model.*
 import com.pothole.khadda.sensor.SensorCollector
+import com.pothole.khadda.sensor.SensorStreamTracker
 import com.pothole.khadda.simulation.RoadSimulationManager
 import com.pothole.khadda.ui.MainActivity
 import com.pothole.khadda.utils.AlertHelper
+import com.pothole.khadda.utils.ModelMetadataUtil
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import java.io.File
+import java.io.FileOutputStream
+import java.util.ArrayDeque
 import java.util.UUID
+import kotlin.math.abs
 
 /**
  * Foreground Service that keeps accelerometer and GPS sensing active continuously
  * even when the phone screen is locked or the user navigates to other apps.
+ *
+ * Architecture (Post-Ride Batch Verification):
+ * - During ride: Physical sensors (2-vote rule + kinematic filters) log CandidateEvents.
+ * - Copied frames are dispatched via a Channel to a single background IO worker coroutine,
+ *   which compresses JPEGs (quality 90) and stores CandidateEvents with status PENDING.
+ * - Zero model inference runs during the ride, keeping the 100 Hz sensor stream completely intact.
  */
 class DetectionForegroundService : LifecycleService() {
 
@@ -61,22 +71,146 @@ class DetectionForegroundService : LifecycleService() {
     // Callbacks for UI subscribers
     var onLiveSensorData: ((SensorData) -> Unit)? = null
     var onPotholeDetected: ((PotholeEvent) -> Unit)? = null
+    var onCandidateLogged: ((CandidateEvent) -> Unit)? = null
     var onLocationUpdated: ((Double, Double, Float) -> Unit)? = null
+    var onVerificationProgress: ((current: Int, total: Int, confirmedCount: Int) -> Unit)? = null
+    var onVerificationComplete: ((total: Int, confirmedCount: Int, rejectedCount: Int) -> Unit)? = null
+
+    var isVerifying: Boolean = false
+        private set
+    var verificationTotal: Int = 0
+        private set
+    var verificationCurrent: Int = 0
+        private set
+    var verificationConfirmed: Int = 0
+        private set
+    var verificationRejected: Int = 0
+        private set
+
+    private val verificationProgressListeners = mutableListOf<(current: Int, total: Int, confirmedCount: Int) -> Unit>()
+    private val verificationCompleteListeners = mutableListOf<(total: Int, confirmedCount: Int, rejectedCount: Int) -> Unit>()
+
+    fun registerVerificationProgressListener(listener: (current: Int, total: Int, confirmedCount: Int) -> Unit) {
+        synchronized(verificationProgressListeners) {
+            if (!verificationProgressListeners.contains(listener)) {
+                verificationProgressListeners.add(listener)
+            }
+        }
+        if (isVerifying && verificationTotal > 0) {
+            listener.invoke(verificationCurrent, verificationTotal, verificationConfirmed)
+        }
+    }
+
+    fun unregisterVerificationProgressListener(listener: (current: Int, total: Int, confirmedCount: Int) -> Unit) {
+        synchronized(verificationProgressListeners) {
+            verificationProgressListeners.remove(listener)
+        }
+    }
+
+    fun registerVerificationCompleteListener(listener: (total: Int, confirmedCount: Int, rejectedCount: Int) -> Unit) {
+        synchronized(verificationCompleteListeners) {
+            if (!verificationCompleteListeners.contains(listener)) {
+                verificationCompleteListeners.add(listener)
+            }
+        }
+    }
+
+    fun unregisterVerificationCompleteListener(listener: (total: Int, confirmedCount: Int, rejectedCount: Int) -> Unit) {
+        synchronized(verificationCompleteListeners) {
+            verificationCompleteListeners.remove(listener)
+        }
+    }
+
+    private var verificationJob: Job? = null
 
     private lateinit var telemetryLogger: TelemetryLogger
-    
+    private val streamTracker = SensorStreamTracker()
+
+    private var candidateCount = 0
     private var potholeCount = 0
 
     private var lastSpeed = 0f
     private var lastLocationTime = 0L
     private var currentGpsAccel = 0f
-    
+
     private val frameBuffer = ArrayDeque<Pair<Long, Bitmap>>()
     private var lastFrameTime = 0L
     private var cameraProvider: ProcessCameraProvider? = null
-    private var cameraControl: androidx.camera.core.CameraControl? = null
-    
-    var isTorchEnabled = true
+    private var cameraControl: CameraControl? = null
+
+    var isTorchEnabled = false
+
+    // Background Channel for offloading disk I/O and JPEG compression
+    private val candidateChannel = Channel<CandidateWriteRequest>(capacity = 64)
+
+    private data class CandidateWriteRequest(
+        val candidateId: String,
+        val sessionId: String,
+        val timestampMs: Long,
+        val latitude: Double,
+        val longitude: Double,
+        val speedMps: Float,
+        val triggeredZDiff: Boolean,
+        val triggeredZThresh: Boolean,
+        val triggeredStdev: Boolean,
+        val triggeredGZero: Boolean,
+        val zDiff: Double,
+        val zThresh: Double,
+        val stdev: Double,
+        val impact: Double,
+        val severity: SeverityLevel,
+        val frames: List<Bitmap>
+    )
+
+    private data class PendingVibrationCapture(
+        val candidateId: String,
+        val sessionId: String,
+        val timestampMs: Long,
+        val latitude: Double,
+        val longitude: Double,
+        val speedMps: Float,
+        val triggeredZDiff: Boolean,
+        val triggeredZThresh: Boolean,
+        val triggeredStdev: Boolean,
+        val triggeredGZero: Boolean,
+        val zDiff: Double,
+        val zThresh: Double,
+        val stdev: Double,
+        val impact: Double,
+        val severity: SeverityLevel,
+        val targetFrames: Int = MAX_CANDIDATE_FRAMES,
+        val collectedFrames: MutableList<Bitmap> = mutableListOf(),
+        val createdAtMs: Long = System.currentTimeMillis()
+    )
+
+    private val pendingVibrationCaptures = java.util.Collections.synchronizedList(mutableListOf<PendingVibrationCapture>())
+
+    private fun dispatchCandidateRequest(cap: PendingVibrationCapture) {
+        val request = CandidateWriteRequest(
+            candidateId = cap.candidateId,
+            sessionId = cap.sessionId,
+            timestampMs = cap.timestampMs,
+            latitude = cap.latitude,
+            longitude = cap.longitude,
+            speedMps = cap.speedMps,
+            triggeredZDiff = cap.triggeredZDiff,
+            triggeredZThresh = cap.triggeredZThresh,
+            triggeredStdev = cap.triggeredStdev,
+            triggeredGZero = cap.triggeredGZero,
+            zDiff = cap.zDiff,
+            zThresh = cap.zThresh,
+            stdev = cap.stdev,
+            impact = cap.impact,
+            severity = cap.severity,
+            frames = cap.collectedFrames
+        )
+        val sendResult = candidateChannel.trySend(request)
+        if (!sendResult.isSuccess) {
+            serviceScope.launch(Dispatchers.IO) {
+                candidateChannel.send(request)
+            }
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): DetectionForegroundService = this@DetectionForegroundService
@@ -102,6 +236,71 @@ class DetectionForegroundService : LifecycleService() {
         visionAnalyzer = PotholeVisionAnalyzer(this)
 
         setupListeners()
+        startCandidateWriterWorker()
+    }
+
+    private fun startCandidateWriterWorker() {
+        serviceScope.launch(Dispatchers.IO) {
+            for (request in candidateChannel) {
+                processCandidateWriteRequest(request)
+            }
+        }
+    }
+
+    private suspend fun processCandidateWriteRequest(request: CandidateWriteRequest) {
+        val sessionDir = File(applicationContext.filesDir, "sessions/${request.sessionId}/candidates")
+        if (!sessionDir.exists()) {
+            sessionDir.mkdirs()
+        }
+
+        val savedPaths = mutableListOf<String>()
+        for ((idx, bitmap) in request.frames.withIndex()) {
+            val file = File(sessionDir, "cand_${request.candidateId}_$idx.jpg")
+            try {
+                FileOutputStream(file).use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                    out.flush()
+                }
+                savedPaths.add(file.absolutePath)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error compressing candidate JPEG: ${e.message}", e)
+            } finally {
+                bitmap.recycle() // Release copied bitmap memory immediately
+            }
+        }
+
+        val candidate = CandidateEvent(
+            id = request.candidateId,
+            sessionId = request.sessionId,
+            timestampMs = request.timestampMs,
+            latitude = request.latitude,
+            longitude = request.longitude,
+            speedMps = request.speedMps,
+            triggeredZDiff = request.triggeredZDiff,
+            triggeredZThresh = request.triggeredZThresh,
+            triggeredStdev = request.triggeredStdev,
+            triggeredGZero = request.triggeredGZero,
+            zDiff = request.zDiff,
+            zThresh = request.zThresh,
+            stdev = request.stdev,
+            impact = request.impact,
+            severity = request.severity,
+            status = CandidateStatus.PENDING,
+            maxConfidence = 0.0f,
+            framePaths = savedPaths,
+            inferenceMsPerFrame = 0L,
+            modelFileName = PotholeVisionAnalyzer.DEFAULT_MODEL_FILE,
+            createdAt = System.currentTimeMillis()
+        )
+
+        try {
+            val repo = (application as KhaddaApplication).repository
+            repo.insertCandidate(candidate)
+            onCandidateLogged?.invoke(candidate)
+            Log.d(TAG, "Successfully persisted candidate ${candidate.id} (frames: ${savedPaths.size}) with status PENDING")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to persist candidate event: ${e.message}", e)
+        }
     }
 
     private fun setupListeners() {
@@ -123,9 +322,8 @@ class DetectionForegroundService : LifecycleService() {
             }
             lastSpeed = loc.speed
             lastLocationTime = now
-            
-            // Log GPS fixes separately
-            val elapsedNanos = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.JELLY_BEAN_MR1) {
+
+            val elapsedNanos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
                 loc.elapsedRealtimeNanos
             } else {
                 android.os.SystemClock.elapsedRealtimeNanos()
@@ -134,7 +332,7 @@ class DetectionForegroundService : LifecycleService() {
                 elapsedNanos, loc.latitude, loc.longitude, loc.speed, loc.accuracy, loc.bearing
             )
 
-            onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.speed * 3.6f)
+            onLocationUpdated?.invoke(loc.latitude, loc.longitude, loc.speed)
         }
 
         // Simulation listeners
@@ -144,15 +342,25 @@ class DetectionForegroundService : LifecycleService() {
             }
         }
 
-        simulationManager.onSimulatedLocation = { lat, lon, speed ->
-            onLocationUpdated?.invoke(lat, lon, speed)
+        simulationManager.onSimulatedLocation = { lat, lon, speedKmh ->
+            lastSpeed = speedKmh / 3.6f
+            lastLocationTime = System.currentTimeMillis()
+            onLocationUpdated?.invoke(lat, lon, lastSpeed)
         }
     }
 
+    /**
+     * Sensor processing callback executed at 100 Hz.
+     * Contains only lightweight math and in-memory bitmap copying.
+     * ZERO disk I/O and ZERO model inference.
+     */
     private fun processSensorSample(data: SensorData) {
-        val timeSinceStart = System.currentTimeMillis() - (currentSession?.startTime ?: 0L)
-        if (timeSinceStart < 1000L) return // Drop first second to let gravity stabilize
-        
+        val startNs = System.nanoTime()
+        streamTracker.recordSampleArrival(data.timestampNs)
+        try {
+            val timeSinceStart = System.currentTimeMillis() - (currentSession?.startTime ?: 0L)
+            if (timeSinceStart < 1000L) return // Drop first second to let gravity stabilize
+
         onLiveSensorData?.invoke(data)
 
         // 1. Extract signal features and update rolling window
@@ -170,7 +378,7 @@ class DetectionForegroundService : LifecycleService() {
             data.gyroX.toFloat(), data.gyroY.toFloat(), data.gyroZ.toFloat()
         )
 
-        // 1.5 Obtain location early for logging
+        // Obtain location for candidate logging
         val (lat, lon) = if (isSimulationMode) {
             val loc = locationTracker.currentLocation
             Pair(loc?.latitude ?: 18.5204, loc?.longitude ?: 73.8567)
@@ -179,164 +387,99 @@ class DetectionForegroundService : LifecycleService() {
             Pair(loc?.latitude ?: 0.0, loc?.longitude ?: 0.0)
         }
 
-        // 2. Evaluate algorithms
+        // 2. Evaluate physical detection algorithms
         val triggered = detector.getTriggeredAlgorithms(features)
         val isCandidate = triggered.isNotEmpty() || features.zDiff >= (detector.zDiffThreshold / 2.0)
 
-        if (isCandidate) {
-            var rejectedReason = ""
-            var isValid = true
+        if (!isCandidate) return
 
-            // Require 2 votes
-            if (triggered.size < 2) {
-                isValid = false
-                rejectedReason = "Failed 2-vote rule (Got ${triggered.size})"
-            } else {
-                // False-positive validation
-                val validation = falsePositiveFilter.validateTrigger(features, lat, lon, lastSpeed)
-                if (!validation.isValid) {
-                    isValid = false
-                    rejectedReason = validation.reason
-                } else {
-                    // Passed accelerometer false-positive filter. Now run Hybrid Vision AI!
-                    // Extract ALL frames from the last 3 seconds
-                    val framesToAnalyze = mutableListOf<Bitmap>()
-                    val eventTimeNs = data.timestampNs
-                    val threeSecondsNs = 3_000_000_000L
-                    
-                    synchronized(frameBuffer) {
-                        // Grab frames that are within 3 seconds prior to the event
-                        for (frame in frameBuffer) {
-                            val ageNs = eventTimeNs - frame.first
-                            if (ageNs in 0..threeSecondsNs) {
-                                framesToAnalyze.add(frame.second)
-                            }
-                        }
-                    }
+        var rejectedReason = ""
+        var isValid = true
 
-                    var isVisuallyConfirmed = false
-                    
-                    if (framesToAnalyze.isNotEmpty()) {
-                        // Only analyze the 3 most recent frames to prevent motion-blur false positives and memory spikes
-                        val framesToProcess = framesToAnalyze.reversed().take(3)
-                        for ((index, frame) in framesToProcess.withIndex()) {
-                            android.util.Log.d("HybridSystem", "Analyzing frame ${index + 1}/${framesToProcess.size} for visual confirmation...")
-                            if (visionAnalyzer.validatePothole(frame)) {
-                                isVisuallyConfirmed = true
-                                break // Stop analyzing once we find a pothole!
-                            }
-                        }
-                    } else {
-                        android.util.Log.w("HybridSystem", "Frame buffer was empty! Skipping vision validation.")
-                    }
-
-                    if (!isVisuallyConfirmed) {
-                        isValid = false
-                        rejectedReason = "Filtered: Vision YOLO Rejected (No pothole found in the 3 most recent photos)"
-                        
-                        // Save the most recent rejected frame for debugging purposes
-                        val rejectedFrame = framesToAnalyze.lastOrNull() ?: frameBuffer.lastOrNull()?.second
-                        rejectedFrame?.let {
-                            serviceScope.launch(Dispatchers.IO) {
-                                try {
-                                    val file = File(applicationContext.filesDir, "rejected_pothole_${System.currentTimeMillis()}.jpg")
-                                    val out = FileOutputStream(file)
-                                    it.compress(Bitmap.CompressFormat.JPEG, 90, out)
-                                    out.flush()
-                                    out.close()
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // val hasValidFix = (speedAgeMs < 2000L) && (locationTracker.accuracy < 20f) && (lat != 0.0)
-            // if (!hasValidFix && isValid) {
-            //     isValid = false
-            //     rejectedReason = "Filtered: No recent GPS fix (Age: $speedAgeMs, Acc: ${locationTracker.accuracy})"
-            // }
-
-            telemetryLogger.logCandidate(
-                data.timestampNs, lat, lon, lastSpeed, features.yaw,
-                features.zDiff, features.stdevZ, features.zThreshDiff,
-                triggered.contains(AlgorithmType.Z_DIFF),
-                triggered.contains(AlgorithmType.Z_THRESH),
-                triggered.contains(AlgorithmType.STDEV_Z),
-                triggered.contains(AlgorithmType.G_ZERO),
-                triggered.size, rejectedReason
-            )
-
-            if (!isValid) return
+        // Require 2-vote rule
+        if (triggered.size < 2) {
+            isValid = false
+            rejectedReason = "Failed 2-vote rule (Got ${triggered.size})"
         } else {
-            return
+            // Kinematic false-positive validation (braking, turning, cooldown)
+            val validation = falsePositiveFilter.validateTrigger(features, lat, lon, lastSpeed)
+            if (!validation.isValid) {
+                isValid = false
+                rejectedReason = validation.reason
+            }
         }
-        
-        val result = detector.buildResult(features, triggered)
 
-        // 3. Confirmed Pothole Event creation
-        potholeCount++
-        val session = currentSession
-        val event = PotholeEvent(
-            eventId = UUID.randomUUID().toString(),
-            sessionId = session?.sessionId ?: "",
-            timestamp = System.currentTimeMillis(),
-            latitude = lat,
-            longitude = lon,
-            zDiffValue = result.impactMagnitude,
-            severity = result.severity,
-            algorithm = result.primaryAlgorithm.displayName,
-            status = RepairStatus.REPORTED,
-            syncStatus = "QUEUED"
+        // Cap candidates per session at MAX_CANDIDATES_PER_SESSION
+        if (isValid && candidateCount >= MAX_CANDIDATES_PER_SESSION) {
+            Log.w(TAG, "Candidate cap reached ($MAX_CANDIDATES_PER_SESSION). Dropping candidate.")
+            isValid = false
+            rejectedReason = "Filtered: Session candidate cap ($MAX_CANDIDATES_PER_SESSION) reached"
+        }
+
+        telemetryLogger.logCandidate(
+            data.timestampNs, lat, lon, lastSpeed, features.yaw,
+            features.zDiff, features.stdevZ, features.zThreshDiff,
+            triggered.contains(AlgorithmType.Z_DIFF),
+            triggered.contains(AlgorithmType.Z_THRESH),
+            triggered.contains(AlgorithmType.STDEV_Z),
+            triggered.contains(AlgorithmType.G_ZERO),
+            triggered.size, rejectedReason
         )
 
-        falsePositiveFilter.recordConfirmedEvent(event)
-        alertHelper.triggerAlert(event.severity)
-        updateNotification("Potholes Detected: $potholeCount (Last: ${event.severity} at ${event.algorithm})")
+        if (!isValid) return
 
-        // 6. Persist to Room SQLite Database
-        serviceScope.launch {
-            val repo = (application as KhaddaApplication).repository
-            repo.insertEvent(event)
-            session?.let {
-                it.totalEvents = potholeCount
-                repo.updateSession(it)
-            }
-        }
+        // 3. Candidate Accepted by Physical Sensors!
+        candidateCount++
+        val result = detector.buildResult(features, triggered)
 
-        onPotholeDetected?.invoke(event)
+        // Instant feedback: alert sound and notification update
+        alertHelper.triggerAlert(result.severity)
+        updateNotification("Road Anomalies Logged: $candidateCount (Pending Verification)")
 
-        // 7. Save camera frame closest to eventTime - lookback
-        val speedMps2 = lastSpeed
-        var lookbackS2 = if (speedMps2 > 0.1f) 8f / speedMps2 else 2f
-        lookbackS2 = lookbackS2.coerceIn(0.3f, 2f) + 0.1f // add latency
+        // 4. Capture 5 frames after vibration detected
+        val candidateId = UUID.randomUUID().toString()
+        val capture = PendingVibrationCapture(
+            candidateId = candidateId,
+            sessionId = currentSession?.sessionId ?: "",
+            timestampMs = System.currentTimeMillis(),
+            latitude = lat,
+            longitude = lon,
+            speedMps = lastSpeed,
+            triggeredZDiff = triggered.contains(AlgorithmType.Z_DIFF),
+            triggeredZThresh = triggered.contains(AlgorithmType.Z_THRESH),
+            triggeredStdev = triggered.contains(AlgorithmType.STDEV_Z),
+            triggeredGZero = triggered.contains(AlgorithmType.G_ZERO),
+            zDiff = features.zDiff,
+            zThresh = features.zThreshDiff,
+            stdev = features.stdevZ,
+            impact = result.impactMagnitude,
+            severity = result.severity,
+            targetFrames = MAX_CANDIDATE_FRAMES
+        )
 
-        val eventTimeNs = data.timestampNs
-        val targetTimeNs2 = eventTimeNs - (lookbackS2 * 1_000_000_000L).toLong()
-
-        var finalBestFrame: Bitmap? = null
-        synchronized(frameBuffer) {
-            finalBestFrame = frameBuffer.minByOrNull { abs(it.first - targetTimeNs2) }?.second
-        }
-
-        finalBestFrame?.let {
-            serviceScope.launch(Dispatchers.IO) {
-                try {
-                    val file = File(applicationContext.filesDir, "pothole_${event.eventId}.jpg")
-                    val out = FileOutputStream(file)
-                    it.compress(Bitmap.CompressFormat.JPEG, 90, out)
-                    out.flush()
-                    out.close()
-                } catch (e: Exception) {
-                    e.printStackTrace()
+        if (cameraProvider == null || isSimulationMode) {
+            val copiedFrames = mutableListOf<Bitmap>()
+            synchronized(frameBuffer) {
+                for (item in frameBuffer.toList().takeLast(MAX_CANDIDATE_FRAMES)) {
+                    if (!item.second.isRecycled) {
+                        try {
+                            item.second.copy(Bitmap.Config.ARGB_8888, false)?.let { copiedFrames.add(it) }
+                        } catch (e: Exception) {}
+                    }
                 }
             }
+            capture.collectedFrames.addAll(copiedFrames)
+            dispatchCandidateRequest(capture)
+        } else {
+            // Camera active: collect the next 5 incoming frames after vibration
+            synchronized(pendingVibrationCaptures) {
+                pendingVibrationCaptures.add(capture)
+            }
         }
-
+    } finally {
+        streamTracker.recordCallbackDuration(System.nanoTime() - startNs)
     }
-
+}
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -353,13 +496,43 @@ class DetectionForegroundService : LifecycleService() {
                     lastFrameTime = now
                     val bitmap = imageProxy.toBitmap()
                     val timestampNs = imageProxy.imageInfo.timestamp
-                    
+
                     synchronized(frameBuffer) {
                         frameBuffer.addLast(Pair(timestampNs, bitmap))
-                        // Keep 25 frames (about 5 seconds of history at 5 FPS)
+                        // Keep ring buffer bounded at 25 frames (~5s at 5 FPS)
                         if (frameBuffer.size > 25) {
-                            frameBuffer.removeFirst()
+                            val evicted = frameBuffer.removeFirst()
+                            if (!evicted.second.isRecycled) {
+                                evicted.second.recycle() // Recycle evicted frame to reduce GC stutter
+                            }
                         }
+                    }
+
+                    // Deliver incoming post-vibration frames to active captures
+                    val completedCaptures = mutableListOf<PendingVibrationCapture>()
+                    synchronized(pendingVibrationCaptures) {
+                        val iterator = pendingVibrationCaptures.iterator()
+                        while (iterator.hasNext()) {
+                            val capture = iterator.next()
+                            if (capture.collectedFrames.size < capture.targetFrames) {
+                                try {
+                                    val copy = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                    if (copy != null) {
+                                        capture.collectedFrames.add(copy)
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed to copy post-vibration frame: ${e.message}")
+                                }
+                            }
+                            if (capture.collectedFrames.size >= capture.targetFrames || (now - capture.createdAtMs > 4000L)) {
+                                completedCaptures.add(capture)
+                                iterator.remove()
+                            }
+                        }
+                    }
+
+                    for (cap in completedCaptures) {
+                        dispatchCandidateRequest(cap)
                     }
                 }
                 imageProxy.close()
@@ -384,103 +557,56 @@ class DetectionForegroundService : LifecycleService() {
 
     fun triggerManualPothole(eventType: String = "MANUAL_TRIGGER", forceAiResult: Boolean? = null) {
         telemetryLogger.markNextRowWithLabel(eventType)
-        
+
         val lat = locationTracker.currentLocation?.latitude ?: 0.0
         val lon = locationTracker.currentLocation?.longitude ?: 0.0
         val session = currentSession
 
-        val framesToAnalyze = mutableListOf<Bitmap>()
-        val eventTimeNs = android.os.SystemClock.elapsedRealtimeNanos()
-        val threeSecondsNs = 3_000_000_000L
-        
-        synchronized(frameBuffer) {
-            for (frame in frameBuffer) {
-                val ageNs = eventTimeNs - frame.first
-                if (ageNs in 0..threeSecondsNs) {
-                    framesToAnalyze.add(frame.second)
-                }
-            }
+        if (candidateCount >= MAX_CANDIDATES_PER_SESSION) {
+            Log.w(TAG, "Candidate cap reached ($MAX_CANDIDATES_PER_SESSION)")
+            return
         }
 
-        var aiConfirmed = forceAiResult ?: false
-        if (forceAiResult == null && framesToAnalyze.isNotEmpty()) {
-            for ((index, frame) in framesToAnalyze.reversed().withIndex()) {
-                android.util.Log.d("HybridSystem", "[Manual Test] Analyzing frame ${index + 1}/${framesToAnalyze.size} for visual confirmation...")
-                if (visionAnalyzer.validatePothole(frame)) {
-                    aiConfirmed = true
-                    break
-                }
-            }
-        }
+        candidateCount++
+        alertHelper.triggerAlert(SeverityLevel.HIGH)
+        updateNotification("Road Anomalies Logged: $candidateCount (Manual Trigger)")
 
-        val eventIdStr = UUID.randomUUID().toString()
-
-        if (aiConfirmed) {
-            android.util.Log.d("HybridSystem", "✅ [Manual Test] AI SUCCESSFULLY DETECTED POTHOLE! (Or Forced)")
-        } else {
-            android.util.Log.e("HybridSystem", "❌ [Manual Test] AI FAILED TO DETECT POTHOLE! (Or Forced Reject)")
-            
-            // Save the rejected frame silently and abort!
-            var bestFrame: Bitmap? = null
-            synchronized(frameBuffer) { bestFrame = frameBuffer.lastOrNull()?.second }
-            bestFrame?.let {
-                serviceScope.launch(Dispatchers.IO) {
-                    try {
-                        val file = File(applicationContext.filesDir, "rejected_pothole_$eventIdStr.jpg")
-                        val out = FileOutputStream(file)
-                        it.compress(Bitmap.CompressFormat.JPEG, 90, out)
-                        out.flush()
-                        out.close()
-                    } catch (e: Exception) { e.printStackTrace() }
-                }
-            }
-            return // Abort! Don't create an event
-        }
-
-        potholeCount++
-        val event = PotholeEvent(
-            eventId = eventIdStr,
+        val candidateId = UUID.randomUUID().toString()
+        val capture = PendingVibrationCapture(
+            candidateId = candidateId,
             sessionId = session?.sessionId ?: "",
-            timestamp = System.currentTimeMillis(),
+            timestampMs = System.currentTimeMillis(),
             latitude = lat,
             longitude = lon,
-            zDiffValue = 9.99, // Fake high impact for manual trigger
+            speedMps = lastSpeed,
+            triggeredZDiff = true,
+            triggeredZThresh = true,
+            triggeredStdev = true,
+            triggeredGZero = false,
+            zDiff = 9.99,
+            zThresh = 9.99,
+            stdev = 5.0,
+            impact = 9.99,
             severity = SeverityLevel.HIGH,
-            algorithm = "MANUAL (AI Confirmed)",
-            status = RepairStatus.REPORTED,
-            syncStatus = "QUEUED"
+            targetFrames = MAX_CANDIDATE_FRAMES
         )
 
-        falsePositiveFilter.recordConfirmedEvent(event)
-        alertHelper.triggerAlert(event.severity)
-        updateNotification("Potholes Detected: $potholeCount (Last: MANUAL)")
-
-        serviceScope.launch {
-            val repo = (application as KhaddaApplication).repository
-            repo.insertEvent(event)
-            session?.let {
-                it.totalEvents = potholeCount
-                repo.updateSession(it)
-            }
-        }
-        onPotholeDetected?.invoke(event)
-
-        // Save the accepted frame
-        var bestFrame: Bitmap? = null
-        synchronized(frameBuffer) {
-            bestFrame = frameBuffer.lastOrNull()?.second
-        }
-        bestFrame?.let {
-            serviceScope.launch(Dispatchers.IO) {
-                try {
-                    val file = File(applicationContext.filesDir, "pothole_${event.eventId}.jpg")
-                    val out = FileOutputStream(file)
-                    it.compress(Bitmap.CompressFormat.JPEG, 90, out)
-                    out.flush()
-                    out.close()
-                } catch (e: Exception) {
-                    e.printStackTrace()
+        if (cameraProvider == null || isSimulationMode) {
+            val copiedFrames = mutableListOf<Bitmap>()
+            synchronized(frameBuffer) {
+                for (item in frameBuffer.toList().takeLast(MAX_CANDIDATE_FRAMES)) {
+                    if (!item.second.isRecycled) {
+                        try {
+                            item.second.copy(Bitmap.Config.ARGB_8888, false)?.let { copiedFrames.add(it) }
+                        } catch (e: Exception) {}
+                    }
                 }
+            }
+            capture.collectedFrames.addAll(copiedFrames)
+            dispatchCandidateRequest(capture)
+        } else {
+            synchronized(pendingVibrationCaptures) {
+                pendingVibrationCaptures.add(capture)
             }
         }
     }
@@ -489,9 +615,11 @@ class DetectionForegroundService : LifecycleService() {
         if (isDetectionActive) return true
 
         isSimulationMode = useSimulation
+        candidateCount = 0
         potholeCount = 0
         dataProcessor.reset()
         falsePositiveFilter.reset()
+        streamTracker.reset()
 
         val newSession = DetectionSession(
             sessionId = UUID.randomUUID().toString(),
@@ -506,9 +634,20 @@ class DetectionForegroundService : LifecycleService() {
 
         startForeground(NOTIFICATION_ID, buildNotification("Pothole Detection Active - Monitoring Road..."))
 
+        val modelSha = ModelMetadataUtil.getModelSha256(this)
         val started = if (isSimulationMode) {
             simulationManager.startSimulation(serviceScope)
-            telemetryLogger.startLogging(newSession.sessionId, "Simulation: true")
+            val meta = """
+                Simulation: true
+                GitCommit: ${BuildConfig.GIT_COMMIT_HASH}
+                ModelFileName: ${PotholeVisionAnalyzer.DEFAULT_MODEL_FILE}
+                ModelSha256: $modelSha
+                ConfidenceThreshold: ${VisionResult.CONFIDENCE_THRESHOLD}
+                MaxCandidateFrames: $MAX_CANDIDATE_FRAMES
+                MaxCandidatesPerSession: $MAX_CANDIDATES_PER_SESSION
+                Thresholds: ZDiff=${detector.zDiffThreshold}, Stdev=${detector.stdevThreshold}, ZThresh=${detector.zThreshThreshold}, GZero=${detector.gZeroThreshold}
+            """.trimIndent()
+            telemetryLogger.startLogging(newSession.sessionId, meta)
             true
         } else {
             locationTracker.startLocationUpdates()
@@ -517,10 +656,16 @@ class DetectionForegroundService : LifecycleService() {
             if (success) {
                 val meta = """
                     Simulation: false
+                    GitCommit: ${BuildConfig.GIT_COMMIT_HASH}
+                    ModelFileName: ${PotholeVisionAnalyzer.DEFAULT_MODEL_FILE}
+                    ModelSha256: $modelSha
+                    ConfidenceThreshold: ${VisionResult.CONFIDENCE_THRESHOLD}
+                    MaxCandidateFrames: $MAX_CANDIDATE_FRAMES
+                    MaxCandidatesPerSession: $MAX_CANDIDATES_PER_SESSION
                     Vehicle: Bike
                     Mount: Handlebar
-                    Phone: ${android.os.Build.MODEL}
-                    Android: ${android.os.Build.VERSION.RELEASE}
+                    Phone: ${Build.MODEL}
+                    Android: ${Build.VERSION.RELEASE}
                     StartTime: ${java.util.Date()}
                     Thresholds: ZDiff=${detector.zDiffThreshold}, Stdev=${detector.stdevThreshold}, ZThresh=${detector.zThreshThreshold}, GZero=${detector.gZeroThreshold}
                 """.trimIndent()
@@ -534,33 +679,211 @@ class DetectionForegroundService : LifecycleService() {
     }
 
     fun stopDetection(): DetectionSession? {
-        if (!isDetectionActive) return currentSession
+        stopMonitoringAndVerify()
+        return currentSession
+    }
 
+    /**
+     * Stops sensor acquisition immediately to free CPU/Looper,
+     * keeps foreground service alive, and runs post-ride batch verification on Dispatchers.Default.
+     */
+    fun stopMonitoringAndVerify(onFinish: ((DetectionSession?) -> Unit)? = null) {
+        if (!isDetectionActive && !isVerifying) {
+            onFinish?.invoke(currentSession)
+            return
+        }
+
+        val session = currentSession
+        val sessionId = session?.sessionId ?: ""
+
+        // 1. Immediately shut down hardware sensor streaming
         isDetectionActive = false
+
+        // Flush any active post-vibration captures before closing
+        synchronized(pendingVibrationCaptures) {
+            for (cap in pendingVibrationCaptures) {
+                dispatchCandidateRequest(cap)
+            }
+            pendingVibrationCaptures.clear()
+        }
+        val streamMetrics = streamTracker.getMetrics()
+        val metricsStr = streamMetrics.toTelemetryString()
+        Log.i(TAG, "Sensor stream metrics:\n$metricsStr")
+        if (sessionId.isNotEmpty()) {
+            telemetryLogger.appendMetadata(sessionId, metricsStr)
+        }
         telemetryLogger.stopLogging()
         sensorCollector.stopSensors()
         locationTracker.stopLocationUpdates()
         simulationManager.stopSimulation()
         cameraProvider?.unbindAll()
 
-        val session = currentSession
+        synchronized(frameBuffer) {
+            for (frame in frameBuffer) {
+                if (!frame.second.isRecycled) {
+                    frame.second.recycle()
+                }
+            }
+            frameBuffer.clear()
+        }
+
+        // 2. Start batch verification inside serviceScope on Dispatchers.Default
+        isVerifying = true
+
+        verificationJob = serviceScope.launch(Dispatchers.Default) {
+            // Short grace period to ensure channel disk writer drains
+            delay(350)
+
+            val repository = (application as KhaddaApplication).repository
+            val pendingCandidates = if (sessionId.isNotEmpty()) {
+                repository.getPendingCandidatesForSession(sessionId)
+            } else {
+                repository.getPendingCandidates()
+            }
+
+            if (pendingCandidates.isEmpty()) {
+                Log.i(TAG, "No pending candidates to verify for session '$sessionId'")
+                completeVerification(session, 0, 0, 0, onFinish)
+                return@launch
+            }
+
+            Log.i(TAG, "Starting post-ride verification of ${pendingCandidates.size} candidates on Dispatchers.Default")
+            var confirmedCount = 0
+            var rejectedCount = 0
+            var errorCount = 0
+
+            verificationTotal = pendingCandidates.size
+            verificationCurrent = 0
+            verificationConfirmed = 0
+            verificationRejected = 0
+
+            updateVerificationNotification(0, pendingCandidates.size, 0)
+            withContext(Dispatchers.Main) {
+                onVerificationProgress?.invoke(0, pendingCandidates.size, 0)
+                synchronized(verificationProgressListeners) {
+                    for (l in verificationProgressListeners) {
+                        l.invoke(0, pendingCandidates.size, 0)
+                    }
+                }
+            }
+
+            for ((index, candidate) in pendingCandidates.withIndex()) {
+                if (!isActive) {
+                    Log.i(TAG, "Post-ride verification cancelled by user (Later option)")
+                    break
+                }
+
+                val status = CandidateVerifier.verifyCandidate(
+                    context = applicationContext,
+                    candidate = candidate,
+                    analyzer = visionAnalyzer,
+                    repository = repository
+                )
+
+                when (status) {
+                    CandidateStatus.CONFIRMED -> confirmedCount++
+                    CandidateStatus.REJECTED -> rejectedCount++
+                    CandidateStatus.ERROR -> errorCount++
+                    CandidateStatus.PENDING -> {}
+                }
+
+                val currentStep = index + 1
+                verificationCurrent = currentStep
+                verificationConfirmed = confirmedCount
+                verificationRejected = rejectedCount
+
+                updateVerificationNotification(currentStep, pendingCandidates.size, confirmedCount)
+                withContext(Dispatchers.Main) {
+                    onVerificationProgress?.invoke(currentStep, pendingCandidates.size, confirmedCount)
+                    synchronized(verificationProgressListeners) {
+                        for (l in verificationProgressListeners) {
+                            l.invoke(currentStep, pendingCandidates.size, confirmedCount)
+                        }
+                    }
+                }
+            }
+
+            completeVerification(session, pendingCandidates.size, confirmedCount, rejectedCount, onFinish)
+        }
+    }
+
+    private suspend fun completeVerification(
+        session: DetectionSession?,
+        total: Int,
+        confirmedCount: Int,
+        rejectedCount: Int,
+        onFinish: ((DetectionSession?) -> Unit)?
+    ) {
+        isVerifying = false
+        potholeCount = confirmedCount
+
         if (session != null) {
             session.endTime = System.currentTimeMillis()
             session.status = SessionStatus.STOPPED
-            session.totalEvents = potholeCount
+            session.totalEvents = confirmedCount
 
-            serviceScope.launch {
-                (application as KhaddaApplication).repository.closeSession(session.sessionId, potholeCount)
+            val repo = (application as KhaddaApplication).repository
+            repo.closeSession(session.sessionId, confirmedCount)
+        }
+
+        withContext(Dispatchers.Main) {
+            onVerificationComplete?.invoke(total, confirmedCount, rejectedCount)
+            synchronized(verificationCompleteListeners) {
+                for (l in verificationCompleteListeners) {
+                    l.invoke(total, confirmedCount, rejectedCount)
+                }
             }
+            onFinish?.invoke(session)
         }
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-        return session
+    }
+
+    /**
+     * User chose "Later". Gracefully cancels the ongoing verification job and stops service.
+     */
+    fun cancelVerification() {
+        verificationJob?.cancel()
+        isVerifying = false
+        verificationCurrent = 0
+        verificationTotal = 0
+        val session = currentSession
+        if (session != null) {
+            session.endTime = System.currentTimeMillis()
+            session.status = SessionStatus.STOPPED
+            serviceScope.launch {
+                (application as KhaddaApplication).repository.updateSession(session)
+            }
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun updateVerificationNotification(current: Int, total: Int, confirmedCount: Int) {
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Khadda - Validating Road Anomalies")
+            .setContentText("Validating $current of $total anomalies ($confirmedCount confirmed)")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setProgress(total, current, false)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .build()
+
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, notification)
     }
 
     fun getDetector(): PotholeDetector = detector
     fun getAlertHelper(): AlertHelper = alertHelper
+    fun getCandidateCount(): Int = candidateCount
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -607,9 +930,12 @@ class DetectionForegroundService : LifecycleService() {
     }
 
     companion object {
+        private const val TAG = "DetectionService"
         const val CHANNEL_ID = "khadda_detection_channel"
         const val NOTIFICATION_ID = 1001
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        const val MAX_CANDIDATE_FRAMES = 5
+        const val MAX_CANDIDATES_PER_SESSION = 300
     }
 }

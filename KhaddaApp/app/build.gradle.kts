@@ -16,6 +16,13 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        val gitCommitHash: String = try {
+            ProcessBuilder("git", "rev-parse", "--short", "HEAD").start().inputStream.bufferedReader().readText().trim()
+        } catch (e: Exception) {
+            "unknown"
+        }
+        buildConfigField("String", "GIT_COMMIT_HASH", "\"$gitCommitHash\"")
     }
 
     buildTypes {
@@ -36,6 +43,7 @@ android {
     }
     buildFeatures {
         viewBinding = true
+        buildConfig = true
     }
 }
 

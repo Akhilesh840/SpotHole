@@ -1,0 +1,52 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.pothole.khadda'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+dependencies {
+    // Current stable Appium Java Client (verified on Maven Central)
+    testImplementation 'io.appium:java-client:9.4.0'
+
+    // JUnit 5 Jupiter Aggregator & Platform
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // AssertJ fluent assertions
+    testImplementation 'org.assertj:assertj-core:3.26.3'
+
+    // SLF4J logging for clean output without logger warnings
+    testImplementation 'org.slf4j:slf4j-simple:2.0.16'
+}
+
+test {
+    useJUnitPlatform()
+
+    // Pass CLI system properties (e.g. -Ddevice.udid=... -Dserver.url=...) to test JVM
+    systemProperties System.getProperties()
+
+    testLogging {
+        events "passed", "skipped", "failed", "standardOut", "standardError"
+        exceptionFormat "full"
+        showExceptions true
+        showCauses true
+        showStackTraces true
+    }
+
+    reports {
+        html.required = true
+        junitXml.required = true
+    }
+}

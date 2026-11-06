@@ -1,27 +1,43 @@
+# Android & Gradle
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
 local.properties
 KhaddaApp/build/
 KhaddaApp/.gradle/
 KhaddaApp/app/build/
+appium-tests/.gradle/
+appium-tests/build/
 
-# Large files and datasets
-*.zip
+# IDE & OS
+.idea/
+.kotlin/
+.cache/
+.DS_Store
+Thumbs.db
+*.log
+
+# Python & Virtual Environments
 venv/
-*.pt
-*.onnx
+__pycache__/
+*.py[cod]
+
+# Large Archives & Heavy Training Artifacts (>100MB / Gigabyte datasets)
+*.zip
+Dataset/
+runs/
 Pothole_Dataset/
-*.pdf
-*.docx
+
+# Word Temporary & Scrap Backup Files
+~$*
+*BACKUP*
+*BEFORE*
+*ORIGINAL*
+*PRE_EDIT*
+*UNTOUCHED*
+*repaired*
+test_2col*
+temp_*

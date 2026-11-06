@@ -15,6 +15,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
@@ -23,6 +24,7 @@ import com.pothole.khadda.databinding.FragmentMonitorBinding
 import com.pothole.khadda.model.PotholeEvent
 import com.pothole.khadda.model.SeverityLevel
 import com.pothole.khadda.service.DetectionForegroundService
+import com.pothole.khadda.ui.MainActivity
 import java.util.Locale
 
 class MonitorFragment : Fragment() {
@@ -67,7 +69,7 @@ class MonitorFragment : Fragment() {
             }
 
             updateUiState(detectionService?.isDetectionActive == true)
-            binding.switchTorch.isChecked = detectionService?.isTorchEnabled ?: true
+            binding.switchTorch.isChecked = detectionService?.isTorchEnabled ?: false
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -202,9 +204,17 @@ class MonitorFragment : Fragment() {
     }
 
     private fun stopDetection() {
-        detectionService?.stopDetection()
-        updateUiState(false)
-        Toast.makeText(requireContext(), "Monitoring Stopped. Session Saved.", Toast.LENGTH_SHORT).show()
+        val totalCandidates = detectionService?.getCandidateCount() ?: 0
+        if (totalCandidates > 0) {
+            updateUiState(false)
+            viewModel.updateVerificationProgress(0, totalCandidates, 0)
+            (activity as? MainActivity)?.showVerificationPopup(totalCandidates)
+            detectionService?.stopMonitoringAndVerify()
+        } else {
+            detectionService?.stopDetection()
+            updateUiState(false)
+            Toast.makeText(requireContext(), "Monitoring Stopped. No candidates logged.", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun updateUiState(active: Boolean) {

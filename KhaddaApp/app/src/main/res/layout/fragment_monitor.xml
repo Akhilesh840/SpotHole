@@ -60,7 +60,7 @@
                         android:text="Torch"
                         android:textColor="@color/on_surface_muted"
                         android:textSize="12sp"
-                        android:checked="true" />
+                        android:checked="false" />
 
                     <com.google.android.material.materialswitch.MaterialSwitch
                         android:id="@+id/switchDemoMode"

@@ -10,6 +10,7 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import com.pothole.khadda.R
 import com.pothole.khadda.databinding.FragmentMapBinding
+import com.pothole.khadda.model.CandidateEvent
 import com.pothole.khadda.model.PotholeEvent
 import com.pothole.khadda.model.SeverityLevel
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
@@ -24,6 +25,7 @@ class MapFragment : Fragment() {
 
     private val viewModel: MapViewModel by activityViewModels()
     private var allEvents: List<PotholeEvent> = emptyList()
+    private var pendingCandidates: List<CandidateEvent> = emptyList()
     private var selectedSeverityFilter: SeverityLevel? = null
 
     override fun onCreateView(
@@ -53,24 +55,23 @@ class MapFragment : Fragment() {
         }
 
         binding.fabMyLocation.setOnClickListener {
-            if (allEvents.isNotEmpty()) {
-                val latest = allEvents.first()
-                if (latest.latitude != 0.0 && latest.longitude != 0.0) {
-                    mapController.animateTo(GeoPoint(latest.latitude, latest.longitude))
-                    mapController.setZoom(16.0)
-                }
-            } else {
-                mapController.animateTo(defaultPoint)
-            }
+            val target = allEvents.firstOrNull { it.latitude != 0.0 && it.longitude != 0.0 }?.let {
+                GeoPoint(it.latitude, it.longitude)
+            } ?: pendingCandidates.firstOrNull { it.latitude != 0.0 && it.longitude != 0.0 }?.let {
+                GeoPoint(it.latitude, it.longitude)
+            } ?: defaultPoint
+
+            mapController.animateTo(target)
+            mapController.setZoom(16.0)
         }
 
         // Chip Filters
         binding.chipGroupSeverity.setOnCheckedStateChangeListener { _, checkedIds ->
-            when {
-                checkedIds.contains(R.id.chipHigh) -> selectedSeverityFilter = SeverityLevel.HIGH
-                checkedIds.contains(R.id.chipMedium) -> selectedSeverityFilter = SeverityLevel.MEDIUM
-                checkedIds.contains(R.id.chipLow) -> selectedSeverityFilter = SeverityLevel.LOW
-                else -> selectedSeverityFilter = null
+            selectedSeverityFilter = when {
+                checkedIds.contains(R.id.chipHigh) -> SeverityLevel.HIGH
+                checkedIds.contains(R.id.chipMedium) -> SeverityLevel.MEDIUM
+                checkedIds.contains(R.id.chipLow) -> SeverityLevel.LOW
+                else -> null
             }
             refreshMarkers()
         }
@@ -85,18 +86,24 @@ class MapFragment : Fragment() {
                 }
             }
         }
+
+        viewModel.pendingCandidates.observe(viewLifecycleOwner) { candidates ->
+            pendingCandidates = candidates
+            refreshMarkers()
+        }
     }
 
     private fun refreshMarkers() {
         binding.mapView.overlays.clear()
 
-        val filtered = if (selectedSeverityFilter == null) {
+        val filteredEvents = if (selectedSeverityFilter == null) {
             allEvents
         } else {
             allEvents.filter { it.severity == selectedSeverityFilter }
         }
 
-        for (event in filtered) {
+        // 1. Confirmed Pothole Events (recolored by severity: Green, Yellow, Red)
+        for (event in filteredEvents) {
             if (event.latitude == 0.0 && event.longitude == 0.0) continue
 
             val point = GeoPoint(event.latitude, event.longitude)
@@ -122,6 +129,31 @@ class MapFragment : Fragment() {
 
             binding.mapView.overlays.add(marker)
         }
+
+        // 2. Pending Candidates during ride (Gray markers)
+        for (candidate in pendingCandidates) {
+            if (candidate.latitude == 0.0 && candidate.longitude == 0.0) continue
+            if (selectedSeverityFilter != null && candidate.severity != selectedSeverityFilter) continue
+
+            val point = GeoPoint(candidate.latitude, candidate.longitude)
+            val marker = Marker(binding.mapView)
+            marker.position = point
+            marker.title = "Pending Anomaly (${candidate.severity})"
+            marker.snippet = String.format(Locale.US, "Impact: %.2f m/s² | Status: PENDING VERIFICATION", candidate.impact)
+
+            val markerDrawable = ContextCompat.getDrawable(requireContext(), R.drawable.ic_pothole_marker)?.mutate()
+            markerDrawable?.setTint(Color.parseColor("#9CA3AF")) // Gray marker for pending
+            marker.icon = markerDrawable
+
+            marker.setOnMarkerClickListener { m, _ ->
+                showCandidateMarkerDetail(candidate)
+                binding.mapView.controller.animateTo(m.position)
+                true
+            }
+
+            binding.mapView.overlays.add(marker)
+        }
+
         binding.mapView.invalidate()
     }
 
@@ -138,6 +170,15 @@ class MapFragment : Fragment() {
             SeverityLevel.LOW -> Color.parseColor("#10B981")
         }
         binding.tvMarkerSeverity.setBackgroundColor(color)
+    }
+
+    private fun showCandidateMarkerDetail(candidate: CandidateEvent) {
+        binding.cardMarkerDetail.visibility = View.VISIBLE
+        binding.tvMarkerSeverity.text = "PENDING (${candidate.severity.name})"
+        binding.tvMarkerAlgorithm.text = String.format(Locale.US, "Impact: %.2f m/s² (Awaiting Verification)", candidate.impact)
+        binding.tvMarkerLocation.text = String.format(Locale.US, "Location: %.5f°, %.5f°", candidate.latitude, candidate.longitude)
+        binding.tvMarkerStatus.text = "Status: PENDING VERIFICATION"
+        binding.tvMarkerSeverity.setBackgroundColor(Color.parseColor("#6B7280"))
     }
 
     override fun onResume() {

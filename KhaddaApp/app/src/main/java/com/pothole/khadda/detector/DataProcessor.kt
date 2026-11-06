@@ -18,7 +18,7 @@ data class FeatureSet(
     val roll: Double,
     val pitch: Double,
     val yaw: Double,
-    val vertAccel: Double
+    val vertAccel: Double = 0.0
 )
 
 /**

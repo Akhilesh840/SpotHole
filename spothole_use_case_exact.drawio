@@ -1,0 +1,98 @@
+<?xml version="1.0" ?>
+<mxfile host="app.diagrams.net" modified="2026-10-20T00:00:00.000Z" agent="Antigravity" version="24.7.17" type="device">
+  <diagram id="spothole-use-case-exact" name="Use Case Diagram">
+    <mxGraphModel dx="1300" dy="850" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" page="1" pageScale="1" pageWidth="1100" pageHeight="750" background="#ffffff">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="&lt;b&gt;Use Case diagram of spothole Detection System&lt;/b&gt;" parent="1" vertex="1" style="text;html=1;strokeColor=none;fillColor=none;fontColor=#111111;fontSize=20;align=center;verticalAlign=middle;fontFamily=Helvetica;">
+          <mxGeometry x="250" y="25" width="600" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="subsystem" value="&amp;lt;&amp;lt;Subsystem&amp;gt;&amp;gt;&lt;br&gt;&lt;b&gt;spothole System&lt;/b&gt;" parent="1" vertex="1" style="rounded=1;arcSize=14;whiteSpace=wrap;html=1;strokeColor=#4d7c0f;fillColor=#dcfce7;strokeWidth=1.5;fontSize=14;verticalAlign=top;spacingTop=12;fontColor=#14532d;fontFamily=Helvetica;">
+          <mxGeometry x="410" y="90" width="280" height="530" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_driver" value="Commuter /&lt;br&gt;Driver" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="80" y="280" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_rider" value="Motorcycle&lt;br&gt;Rider" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="230" y="160" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_surveyor" value="Road&lt;br&gt;Surveyor" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="230" y="420" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_sensor" value="&amp;lt;&amp;lt;Service&amp;gt;&amp;gt;&lt;br&gt;SensorManager" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="810" y="110" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_camera" value="&amp;lt;&amp;lt;Service&amp;gt;&amp;gt;&lt;br&gt;CameraX Engine" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="810" y="240" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_gps" value="GPS Location&lt;br&gt;Provider" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="810" y="380" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="act_authority" value="Road Maintenance&lt;br&gt;Authority" parent="1" vertex="1" style="shape=umlActor;verticalLabelPosition=bottom;verticalAlign=top;html=1;outlineConnect=0;strokeColor=#27272a;fillColor=#f4f4f5;strokeWidth=1.5;fontColor=#18181b;fontSize=12;fontFamily=Helvetica;">
+          <mxGeometry x="810" y="510" width="55" height="85" as="geometry"/>
+        </mxCell>
+        <mxCell id="uc1" value="Start Road&lt;br&gt;Monitoring" parent="1" vertex="1" style="ellipse;whiteSpace=wrap;html=1;strokeColor=#15803d;fillColor=#ffffff;strokeWidth=1.5;fontColor=#14532d;fontSize=12;fontFamily=Helvetica;align=center;">
+          <mxGeometry x="465" y="165" width="170" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="uc2" value="Detect Road&lt;br&gt;Anomaly" parent="1" vertex="1" style="ellipse;whiteSpace=wrap;html=1;strokeColor=#15803d;fillColor=#ffffff;strokeWidth=1.5;fontColor=#14532d;fontSize=12;fontFamily=Helvetica;align=center;">
+          <mxGeometry x="465" y="275" width="170" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="uc3" value="Verify with&lt;br&gt;YOLOv8" parent="1" vertex="1" style="ellipse;whiteSpace=wrap;html=1;strokeColor=#15803d;fillColor=#ffffff;strokeWidth=1.5;fontColor=#14532d;fontSize=12;fontFamily=Helvetica;align=center;">
+          <mxGeometry x="465" y="400" width="170" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="uc4" value="Record Pothole&lt;br&gt;Event" parent="1" vertex="1" style="ellipse;whiteSpace=wrap;html=1;strokeColor=#15803d;fillColor=#ffffff;strokeWidth=1.5;fontColor=#14532d;fontSize=12;fontFamily=Helvetica;align=center;">
+          <mxGeometry x="465" y="515" width="170" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="g1" parent="1" edge="1" source="act_rider" target="act_driver" style="endArrow=block;endSize=10;endFill=0;html=1;strokeColor=#18181b;strokeWidth=1.3;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="g2" parent="1" edge="1" source="act_surveyor" target="act_driver" style="endArrow=block;endSize=10;endFill=0;html=1;strokeColor=#18181b;strokeWidth=1.3;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="inc1" value="&amp;lt;&amp;lt;include&amp;gt;&amp;gt;" parent="1" edge="1" source="uc2" target="uc1" style="endArrow=open;dashed=1;html=1;strokeColor=#15803d;strokeWidth=1.2;fontColor=#166534;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Helvetica;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="inc2" value="&amp;lt;&amp;lt;include&amp;gt;&amp;gt;" parent="1" edge="1" source="uc2" target="uc3" style="endArrow=open;dashed=1;html=1;strokeColor=#15803d;strokeWidth=1.2;fontColor=#166534;fontSize=11;labelBackgroundColor=#ffffff;fontFamily=Helvetica;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_0" parent="1" edge="1" source="act_rider" target="uc1" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_1" parent="1" edge="1" source="act_rider" target="uc2" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_2" parent="1" edge="1" source="act_surveyor" target="uc1" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_3" parent="1" edge="1" source="act_surveyor" target="uc4" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_4" parent="1" edge="1" source="act_driver" target="uc4" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_5" parent="1" edge="1" source="uc1" target="act_sensor" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_6" parent="1" edge="1" source="uc2" target="act_sensor" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_7" parent="1" edge="1" source="uc2" target="act_camera" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_8" parent="1" edge="1" source="uc3" target="act_camera" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_9" parent="1" edge="1" source="uc3" target="act_gps" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_10" parent="1" edge="1" source="uc4" target="act_gps" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge_11" parent="1" edge="1" source="uc4" target="act_authority" style="endArrow=none;html=1;strokeColor=#27272a;strokeWidth=1.2;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -132,6 +132,18 @@ class TelemetryLogger(private val context: Context) {
         }
     }
 
+    fun appendMetadata(sessionId: String, additionalMetadata: String) {
+        scope.launch {
+            try {
+                val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "KhaddaLogs")
+                val metaFile = File(dir, "metadata_$sessionId.txt")
+                metaFile.appendText("\n\n$additionalMetadata")
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
     fun stopLogging() {
         isLogging = false
         flushJob?.cancel()
